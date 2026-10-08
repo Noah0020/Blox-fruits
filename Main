@@ -230,7 +230,7 @@ end
 
 local TRIGGER_SOUNDS = {
     ["102228729296384"]=true,["140242176732868"]=true,["112809109188560"]=true,["136323728355613"]=true,
-    ["109570290393196"]=true,   -- NEW: 1x1x1x1 M1 sound
+    ["109570290393196"]=true,   -- 1x1x1x1 M1 sound
     ["115026634746636"]=true,["84116622032112"]=true,["108907358619313"]=true,["127793641088496"]=true,
     ["86174610237192"]=true,["95079963655241"]=true,["101199185291628"]=true,["119942598489800"]=true,
     ["84307400688050"]=true,["113037804008732"]=true,["105200830849301"]=true,["75330693422988"]=true,
@@ -259,7 +259,7 @@ local TRIGGER_SOUNDS = {
 
 local TRIGGER_ANIMS = {
     "114506382930939","127245564598429","99829427721752","138938529389204",
-    "106427068964975",          -- NEW: 1x1x1x1 M1 anim
+    "106427068964975",          -- 1x1x1x1 M1 anim
     "111647315359080","92567970681901","124269076578545","94958041603347",
     "109667959938617","130958529065375","118298475669935","126830014841198",
     "121086746534252","18885909645","98456918873918",
@@ -284,20 +284,19 @@ for _, id in ipairs(TRIGGER_ANIMS) do TRIGGER_ANIMS_SET[id] = true end
 local hookedSounds = {}
 
 local function onSoundTrigger(sound)
-    -- ID check first — cheapest possible filter
     local id = extractSoundId(sound)
     if not id or not TRIGGER_SOUNDS[id] then return end
     local ancestor = sound:FindFirstAncestorOfClass("Model")
     if not ancestor or ancestor.Parent ~= KillersFolder then return end
 
-    -- ----- FIRE BLOCK FIRST (nothing runs before this) -----
+    -- ----- FIRE BLOCK FIRST -----
     if CFG.AutoBlockEnabled and CFG.SoundTrigger then
         local killerRoot = ancestor:FindFirstChild("HumanoidRootPart")
         if killerRoot and shouldBlock(killerRoot) then
             if CFG.BlockDelay > 0 then
                 task.delay(CFG.BlockDelay, fireBlock)
             else
-                fireBlock()   -- same-frame, synchronous FireServer call
+                fireBlock()   -- same-frame, synchronous
             end
         end
     end
@@ -409,15 +408,15 @@ if KillersFolder then
 end
 
 -- =========================================================
--- HDT
+-- HDT (27s global cooldown, no manual trigger)
 -- =========================================================
 HDT = {
     Enabled = false, AutoTrigger = true, Speed = 10, Delay = 0,
     StopDistance = 2, SafetyTimeout = 1.5,
-    ReTriggerCooldown = 1.0,
+    Cooldown = 27,
     _dragId = 0, _dragging = false, _conn = nil, _saved = nil,
     _lastFire = 0, _fireDebounce = 0.15,
-    _cooldownUntil = 0,
+    _nextAllowed = 0,
 }
 
 local function startDrag(targetPart)
@@ -451,7 +450,6 @@ local function startDrag(targetPart)
         finished = true
         if HDT._dragId ~= myId then return end
         HDT._dragging = false
-        HDT._cooldownUntil = tick() + (HDT.ReTriggerCooldown or 1.0)
         if HDT._conn then HDT._conn:Disconnect() HDT._conn = nil end
         if hrp and hrp.Parent then
             hrp.AssemblyLinearVelocity = Vector3.zero
@@ -500,9 +498,9 @@ end
 
 function HDT.TriggerFromAutoBlock(force)
     if not force and not HDT.Enabled then return end
-    if tick() < (HDT._cooldownUntil or 0) then return end
-    if tick() - HDT._lastFire < HDT._fireDebounce then return end
     if HDT._dragging then return end
+    if tick() < (HDT._nextAllowed or 0) then return end
+    if tick() - HDT._lastFire < HDT._fireDebounce then return end
 
     local target = nearestKillerPart()
     if not target then return end
@@ -514,6 +512,7 @@ function HDT.TriggerFromAutoBlock(force)
     end
 
     HDT._lastFire = tick()
+    HDT._nextAllowed = tick() + (HDT.Cooldown or 27)
 
     if HDT.Delay > 0 then
         task.delay(HDT.Delay, function() startDrag(target) end)
@@ -521,12 +520,10 @@ function HDT.TriggerFromAutoBlock(force)
         startDrag(target)
     end
 end
-HDT.Trigger = function() HDT.TriggerFromAutoBlock(true) end
 
 lp.CharacterAdded:Connect(function()
     HDT._dragId += 1
     HDT._dragging = false
-    HDT._cooldownUntil = 0
     if HDT._conn then HDT._conn:Disconnect() HDT._conn = nil end
     HDT._saved = nil
 end)
@@ -1906,6 +1903,14 @@ local uiOk, uiErr = pcall(function()
     do
         local S = safeSection(AutoBlockTab, "auto block")
         safe(S, "Toggle", { Title = "enabled", Value = false, Callback = function(v) CFG.AutoBlockEnabled = v end })
+        safe(S, "Button", { Title = "toggle auto block", Callback = function()
+            CFG.AutoBlockEnabled = not CFG.AutoBlockEnabled
+            WindUI:Notify({
+                Title = "auto block",
+                Content = CFG.AutoBlockEnabled and "ENABLED" or "DISABLED",
+                Duration = 2,
+            })
+        end })
         safe(S, "Paragraph", { Title = "info", Desc = "Fires ONLY when an M1 sound or M1 animation is detected, and only if you're inside the killer's forward view cone. Instant — fires the same frame." })
         safe(S, "Slider", { Title = "range", Value = { Min = 8, Max = 60, Default = CFG.DetectionRange }, Callback = function(v) CFG.DetectionRange = v end })
         safe(S, "Slider", { Title = "delay", Value = { Min = 0, Max = 0.5, Default = 0 }, Callback = function(v) CFG.BlockDelay = v end })
@@ -1921,14 +1926,12 @@ local uiOk, uiErr = pcall(function()
         local S = safeSection(HDTTab, "hdt")
         safe(S, "Toggle", { Title = "enabled", Value = false, Callback = function(v) HDT.Enabled = v end })
         safe(S, "Toggle", { Title = "auto on block", Value = true, Callback = function(v) HDT.AutoTrigger = v end })
+        safe(S, "Paragraph", { Title = "info", Desc = "HDT fires at most once every 27 seconds. No manual trigger — it auto-fires when a block is triggered." })
         safe(S, "Slider", { Title = "speed", Value = { Min = 2, Max = 40, Default = HDT.Speed }, Callback = function(v) HDT.Speed = v end })
         safe(S, "Slider", { Title = "delay", Value = { Min = 0, Max = 2, Default = HDT.Delay }, Callback = function(v) HDT.Delay = v end })
         safe(S, "Slider", { Title = "stop distance", Value = { Min = 1, Max = 8, Default = HDT.StopDistance }, Callback = function(v) HDT.StopDistance = v end })
         safe(S, "Slider", { Title = "max drag time", Value = { Min = 0.2, Max = 3, Default = HDT.SafetyTimeout }, Callback = function(v) HDT.SafetyTimeout = v end })
-        safe(S, "Slider", { Title = "re-trigger cd", Value = { Min = 0, Max = 5, Default = HDT.ReTriggerCooldown }, Callback = function(v) HDT.ReTriggerCooldown = v end })
-        safe(S, "Keybind", { Title = "manual trigger", Value = "Q", Callback = function(v)
-            if v and Enum.KeyCode[v] then HDT.Trigger() end
-        end })
+        safe(S, "Slider", { Title = "cooldown (s)", Value = { Min = 1, Max = 120, Default = HDT.Cooldown }, Callback = function(v) HDT.Cooldown = v end })
     end
 
     -- AIM
@@ -2049,6 +2052,23 @@ local uiOk, uiErr = pcall(function()
                 end)
             end)
         end })
+        safe(S, "Button", { Title = "copy discord", Callback = function()
+            local link = "https://discord.gg/ecCpZY8u5"
+            if setclipboard then
+                pcall(setclipboard, link)
+                WindUI:Notify({
+                    Title = "discord",
+                    Content = "link copied: " .. link,
+                    Duration = 4,
+                })
+            else
+                WindUI:Notify({
+                    Title = "discord",
+                    Content = link,
+                    Duration = 6,
+                })
+            end
+        end })
         safe(S, "Button", { Title = "theme: Blood (default)", Callback = function() WindUI:SetTheme("Blood") end })
         safe(S, "Button", { Title = "theme: Dark",           Callback = function() WindUI:SetTheme("Dark") end })
         safe(S, "Button", { Title = "theme: Crimson",        Callback = function() WindUI:SetTheme("Crimson") end })
@@ -2062,6 +2082,6 @@ end
 
 WindUI:Notify({
     Title = "hunter",
-    Content = "loaded — instant block active",
+    Content = "loaded — instant block, HDT 27s cd",
     Duration = 4,
 })
