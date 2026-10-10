@@ -65,8 +65,52 @@ local PUNCH_BUF = buildBuffer("Punch")
 
 local lastBlockFire = 0
 local BLOCK_COOLDOWN = 0.05
+local lastPunchFire = 0
+local PUNCH_COOLDOWN = 0.08
 
 local HDT, AIM, AbilityHook, AUTOGEN, STAB, AZ, HBE, FacingVisual
+
+local CFG = {
+    AutoBlockEnabled = false,
+    BlockDelay       = 0,
+    WallCheck        = true,
+    SoundTrigger     = true,
+    AnimTrigger      = true,
+    PunchAfterBlock  = true,
+    PunchDelay       = 0.12,
+    ESPKillers       = false,
+    ESPSurvivors     = false,
+    ESPGenerators    = false,
+    ESPItems         = false,
+    InfiniteStamina  = false,
+}
+
+-- FIX #8b: shared role helper accessible everywhere (moved up so STAB/HBE can use it)
+local function getMyRole()
+    local c = lp.Character
+    local p = c and c.Parent
+    if p and (p.Name == "Survivors" or p.Name == "Killers") then return p.Name end
+    return nil
+end
+
+local function getMyRoot()
+    local char = lp.Character
+    return char and char:FindFirstChild("HumanoidRootPart") or nil
+end
+
+local function getRoot(m)
+    return m and (m:FindFirstChild("HumanoidRootPart") or m.PrimaryPart) or nil
+end
+
+-- FIX #4: fireBlock now sequences HDT first, then punches after the drag completes
+local function firePunch()
+    if not RemoteEvent then return false end
+    local now = tick()
+    if now - lastPunchFire < PUNCH_COOLDOWN then return false end
+    lastPunchFire = now
+    pcall(function() RemoteEvent:FireServer("UseActorAbility", { PUNCH_BUF }) end)
+    return true
+end
 
 local function fireBlock()
     if not RemoteEvent then return false end
@@ -77,29 +121,30 @@ local function fireBlock()
     if FacingVisual then
         FacingVisual._blockPulse = (FacingVisual._blockPulse or 0) + 1
     end
+
+    -- start HDT drag first if enabled
+    local hdtDidStart = false
     if HDT and HDT.Enabled and HDT.AutoTrigger then
         pcall(function() HDT.TriggerFromAutoBlock() end)
+        if HDT._dragging then hdtDidStart = true end
     end
+
+    -- FIX #4: punch waits for any active HDT drag to finish so the counter lands
+    if CFG.PunchAfterBlock then
+        task.delay(CFG.PunchDelay or 0.12, function()
+            if hdtDidStart then
+                local waited = 0
+                while HDT._dragging and waited < 1.0 do
+                    task.wait(0.05)
+                    waited += 0.05
+                end
+            end
+            pcall(firePunch)
+        end)
+    end
+
     return true
 end
-
-local function firePunch()
-    if not RemoteEvent then return end
-    pcall(function() RemoteEvent:FireServer("UseActorAbility", { PUNCH_BUF }) end)
-end
-
-local CFG = {
-    AutoBlockEnabled = false,
-    BlockDelay       = 0,
-    WallCheck        = true,
-    SoundTrigger     = true,
-    AnimTrigger      = true,
-    ESPKillers       = false,
-    ESPSurvivors     = false,
-    ESPGenerators    = false,
-    ESPItems         = false,
-    InfiniteStamina  = false,
-}
 
 local RAY_LOS = RaycastParams.new()
 RAY_LOS.FilterType = Enum.RaycastFilterType.Exclude
@@ -114,15 +159,6 @@ local function losTo(targetPos, ignoreModel)
     if ignoreModel then table.insert(filter, ignoreModel) end
     RAY_LOS.FilterDescendantsInstances = filter
     return workspace:Raycast(myRoot.Position, delta, RAY_LOS) == nil
-end
-
-local function getMyRoot()
-    local char = lp.Character
-    return char and char:FindFirstChild("HumanoidRootPart") or nil
-end
-
-local function getRoot(m)
-    return m and (m:FindFirstChild("HumanoidRootPart") or m.PrimaryPart) or nil
 end
 
 local function hasLOS(killerRoot)
@@ -159,10 +195,14 @@ local function isClientInKillerBox(killerRoot)
     return true
 end
 
+-- FIX #1: "in range" is now a real distance test, not hardcoded true
+local FACING_RANGE_DEFAULT = 60
 local function getFacingState(killerRoot)
     local myRoot = getMyRoot()
     if not myRoot or not killerRoot then return false, false end
-    local ir = true
+    local dist = (killerRoot.Position - myRoot.Position).Magnitude
+    local rangeLimit = (FacingVisual and FacingVisual.RangeLimit) or FACING_RANGE_DEFAULT
+    local ir = dist <= rangeLimit
     local fp = isClientInKillerBox(killerRoot)
     return ir, fp
 end
@@ -248,6 +288,25 @@ local TRIGGER_ANIMS = {
 local TRIGGER_ANIMS_SET = {}
 for _, id in ipairs(TRIGGER_ANIMS) do TRIGGER_ANIMS_SET[id] = true end
 
+-- FIX #6: per-killer debounce so multiple sounds/animations in one attack only fire once
+local lastAutoBlockByKiller = setmetatable({}, { __mode = "k" })
+local AUTO_BLOCK_KILLER_DEBOUNCE = 0.12
+
+local function tryAutoBlock(killerModel, killerRoot)
+    if not CFG.AutoBlockEnabled then return end
+    if not killerRoot or not killerRoot.Parent then return end
+    if not shouldBlock(killerRoot) then return end
+    local now = tick()
+    local last = lastAutoBlockByKiller[killerModel]
+    if last and now - last < AUTO_BLOCK_KILLER_DEBOUNCE then return end
+    lastAutoBlockByKiller[killerModel] = now
+    if CFG.BlockDelay > 0 then
+        task.delay(CFG.BlockDelay, fireBlock)
+    else
+        fireBlock()
+    end
+end
+
 local hookedSounds = {}
 local lastSoundFire = setmetatable({}, { __mode = "k" })
 
@@ -266,15 +325,9 @@ local function onSoundTrigger(sound)
         FacingVisual.FlashKiller(ancestor)
     end
 
-    if not CFG.AutoBlockEnabled or not CFG.SoundTrigger then return end
+    if not CFG.SoundTrigger then return end
     local killerRoot = ancestor:FindFirstChild("HumanoidRootPart")
-    if not killerRoot then return end
-    if not shouldBlock(killerRoot) then return end
-    if CFG.BlockDelay > 0 then
-        task.delay(CFG.BlockDelay, fireBlock)
-    else
-        fireBlock()
-    end
+    tryAutoBlock(ancestor, killerRoot)
 end
 
 local function hookSound(sound)
@@ -312,15 +365,9 @@ local function onAnimPlayed(killerModel, track)
         FacingVisual.FlashKiller(killerModel)
     end
 
-    if not CFG.AutoBlockEnabled or not CFG.AnimTrigger then return end
+    if not CFG.AnimTrigger then return end
     local killerRoot = killerModel:FindFirstChild("HumanoidRootPart")
-    if not killerRoot then return end
-    if not shouldBlock(killerRoot) then return end
-    if CFG.BlockDelay > 0 then
-        task.delay(CFG.BlockDelay, fireBlock)
-    else
-        fireBlock()
-    end
+    tryAutoBlock(killerModel, killerRoot)
 end
 
 local function hookKiller(killerModel)
@@ -376,17 +423,15 @@ if KillersFolder then
 end
 
 -- =========================================================
--- HDT
--- Drags for 0.4s then stops. 27s cooldown between drags.
--- No UI sliders — all tuned internally.
+-- HDT — 0.4s drag, 27s cooldown, no sliders
 -- =========================================================
 HDT = {
     Enabled = false, AutoTrigger = true,
-    Speed = 12,              -- studs / second
+    Speed = 12,
     StopDistance = 2,
-    DragDuration = 0.4,      -- how long the drag lasts
-    Cooldown = 27,           -- cooldown between drags
-    MaxRange = 40,           -- max start distance
+    DragDuration = 0.4,
+    Cooldown = 27,
+    MaxRange = 40,
     _dragId = 0, _dragging = false, _conn = nil, _saved = nil,
     _lastFire = 0, _fireDebounce = 0.15,
     _cooldownUntil = 0,
@@ -469,7 +514,6 @@ local function startDrag(targetPart)
         hrp.AssemblyAngularVelocity = Vector3.zero
     end)
 
-    -- Fixed drag duration instead of per-slider value
     task.delay(HDT.DragDuration, function()
         if HDT._dragId == myId and HDT._dragging then cleanup() end
     end)
@@ -530,13 +574,6 @@ local function getPing()
     return 0
 end
 
-local function getMyRole()
-    local c = lp.Character
-    local p = c and c.Parent
-    if p and (p.Name == "Survivors" or p.Name == "Killers") then return p.Name end
-    return nil
-end
-
 local function isPlayingSurvivor()
     if getMyRole() ~= "Survivors" then return false end
     local char = lp.Character
@@ -593,9 +630,10 @@ local function predictHRP(hrp)
     return hrp.Position + vel * totalLead
 end
 
+-- FIX #2: AimFor always assigns CurrentAbility so a nil ability (e.g. C pulse) clears overrides
 function AIM.AimFor(duration, abilityName)
     AIM._aimUntil = tick() + (duration or 1.0)
-    if abilityName then AIM.CurrentAbility = abilityName end
+    AIM.CurrentAbility = abilityName
 end
 
 local hrpAutoRotateSaved = nil
@@ -638,13 +676,14 @@ end
 
 -- =========================================================
 -- STUN ABILITY AUTO-AIM
--- Whitelist: Punch, Slash, OneShot, CrystalPitch, Hatchet
 -- =========================================================
 
 local STUN_ABILITY_KEYS = {
     Punch        = true,
     Slash        = true,
     OneShot      = true,
+    AimGun       = true,
+    GunFire      = true,
     CrystalPitch = true,
     Hatchet      = true,
 }
@@ -653,6 +692,8 @@ local ABILITY_LOCKS = {
     Punch        = 2.00,
     Slash        = 0.80,
     OneShot      = 1.20,
+    AimGun       = 0.60,
+    GunFire      = 1.20,
     CrystalPitch = 1.40,
     Hatchet      = 0.95,
 }
@@ -662,6 +703,8 @@ local ABILITY_AIM_PART = {
     Punch        = "Head",
     Slash        = "Head",
     OneShot      = "Head",
+    AimGun       = "Head",
+    GunFire      = "Head",
     CrystalPitch = "Head",
     Hatchet      = "Head",
 }
@@ -682,7 +725,7 @@ AbilityHook = {
     _lastFire       = 0,
     _animConn       = nil,
     _registered     = 0,
-    _lastName       = nil,
+    _lastName       = "",  -- FIX #3: initialize to non-nil so first tick doesn't redundantly reload
 }
 
 local function extractAnimIds(v, out)
@@ -735,6 +778,9 @@ local function registerAnimsFrom(anims, source)
                 Lock      = lock,
             }
         end
+    end
+    if AIM and AIM.Debug then
+        print(string.format("[StunAim] %s: %d anims registered", source or "?", count))
     end
     return count
 end
@@ -793,6 +839,13 @@ local function loadCharacterAnims()
             end
         end
     end)
+
+    if AIM and AIM.Debug then
+        print(string.format("[StunAim] total registered: %d", AbilityHook._registered))
+        for id, info in pairs(STUN_ANIMS) do
+            print("  ", id, "->", info.Ability)
+        end
+    end
 end
 
 local function bindAnimWatch()
@@ -824,6 +877,10 @@ local function bindAnimWatch()
 
         local lock = info.Lock * (AbilityHook.LockMultiplier or 1.0)
         AIM.AimFor(lock, info.Ability)
+
+        if AIM and AIM.Debug then
+            print(string.format("[StunAim] triggered %s for %.2fs", info.Ability, lock))
+        end
     end)
 end
 
@@ -1048,7 +1105,15 @@ end
 
 local ITEM_COLORS = { Medkit = Color3.fromRGB(255,105,180), BloxyCola = Color3.fromRGB(0,150,255) }
 
+-- FIX #8: throttle item scan to 1s so we don't crawl every descendant 2.5x/sec
+local lastItemScan = 0
+local ITEM_SCAN_INTERVAL = 1.0
+
 local function refreshItems()
+    local now = tick()
+    if now - lastItemScan < ITEM_SCAN_INTERVAL then return end
+    lastItemScan = now
+
     local ingame = workspace:FindFirstChild("Map")
     ingame = ingame and ingame:FindFirstChild("Ingame")
     local seen = {}
@@ -1183,20 +1248,24 @@ local function stabFollow(killerModel)
     STAB._savedAutoRotate = myHum and myHum.AutoRotate or true
     if myHum then myHum.AutoRotate = false end
     local endTime = tick() + STAB.FollowDuration
+    -- FIX #5b: guard follow loop so an exception can't leave _stabbing stuck
     STAB._followConn = RunService.RenderStepped:Connect(function()
-        if tick() >= endTime or not STAB._stabbing then stabStopFollow() return end
-        local h = stabGetMyHRP()
-        if not h then stabStopFollow() return end
-        local kHRP = killerModel and stabGetKillerHRP(killerModel)
-        if not kHRP or not kHRP.Parent then stabStopFollow() return end
-        local kCF = kHRP.CFrame
-        local behindPos = kCF.Position - kCF.LookVector * STAB.BehindOffset
-        local targetCF = CFrame.lookAt(
-            Vector3.new(behindPos.X, h.Position.Y, behindPos.Z),
-            Vector3.new(kCF.Position.X, h.Position.Y, kCF.Position.Z)
-        )
-        h.CFrame = h.CFrame:Lerp(targetCF, 0.5)
-        h.AssemblyLinearVelocity = Vector3.zero
+        local ok = pcall(function()
+            if tick() >= endTime or not STAB._stabbing then stabStopFollow() return end
+            local h = stabGetMyHRP()
+            if not h then stabStopFollow() return end
+            local kHRP = killerModel and stabGetKillerHRP(killerModel)
+            if not kHRP or not kHRP.Parent then stabStopFollow() return end
+            local kCF = kHRP.CFrame
+            local behindPos = kCF.Position - kCF.LookVector * STAB.BehindOffset
+            local targetCF = CFrame.lookAt(
+                Vector3.new(behindPos.X, h.Position.Y, behindPos.Z),
+                Vector3.new(kCF.Position.X, h.Position.Y, kCF.Position.Z)
+            )
+            h.CFrame = h.CFrame:Lerp(targetCF, 0.5)
+            h.AssemblyLinearVelocity = Vector3.zero
+        end)
+        if not ok then stabStopFollow() end
     end)
 end
 
@@ -1204,6 +1273,8 @@ local function stabActivate(force)
     if not force and not STAB.Enabled then return end
     if STAB._stabbing then return end
     if tick() - STAB._lastStab < STAB.Cooldown then return end
+    -- FIX #13: role check (survivor only)
+    if getMyRole() ~= "Survivors" then return end
     local myHRP = stabGetMyHRP()
     if not myHRP then return end
     local killer, kHRP = stabGetNearestKiller()
@@ -1212,21 +1283,26 @@ local function stabActivate(force)
 
     STAB._stabbing = true
     STAB._lastStab = tick()
-    local kCF = kHRP.CFrame
-    local behindPos = kCF.Position - kCF.LookVector * STAB.BehindOffset
-    local origin = myHRP.CFrame
-    local behind = CFrame.lookAt(
-        Vector3.new(behindPos.X, origin.Position.Y, behindPos.Z),
-        Vector3.new(kCF.Position.X, origin.Position.Y, kCF.Position.Z)
-    )
-    task.wait(STAB.TeleportDelay)
-    if not STAB.Enabled and not force then STAB._stabbing = false return end
-    if not kHRP or not kHRP.Parent then STAB._stabbing = false return end
-    local now = stabGetMyHRP()
-    if not now then STAB._stabbing = false return end
-    now.CFrame = behind
-    now.AssemblyLinearVelocity = Vector3.zero
-    stabFollow(killer)
+
+    -- FIX #5a: wrap the entire teleport+follow sequence so an error resets _stabbing
+    local ok = pcall(function()
+        local kCF = kHRP.CFrame
+        local behindPos = kCF.Position - kCF.LookVector * STAB.BehindOffset
+        local origin = myHRP.CFrame
+        local behind = CFrame.lookAt(
+            Vector3.new(behindPos.X, origin.Position.Y, behindPos.Z),
+            Vector3.new(kCF.Position.X, origin.Position.Y, kCF.Position.Z)
+        )
+        task.wait(STAB.TeleportDelay)
+        if not STAB.Enabled and not force then return end
+        if not kHRP or not kHRP.Parent then return end
+        local now = stabGetMyHRP()
+        if not now then return end
+        now.CFrame = behind
+        now.AssemblyLinearVelocity = Vector3.zero
+        stabFollow(killer)
+    end)
+    if not ok then STAB._stabbing = false end
 end
 
 _G.HunterStabActivate = stabActivate
@@ -1409,6 +1485,8 @@ end
 
 local function hbeStartDrag()
     if HBE.Mode ~= "Velocity" then return end
+    -- FIX #12: only drag toward killers when we are actually a survivor
+    if getMyRole() ~= "Survivors" then return end
     if HBE._dragConn then return end
     if tick() < (HBE._dragCooldownUntil or 0) then return end
     local char = lp.Character
@@ -1583,6 +1661,7 @@ FacingVisual = {
     InRangeColor = Color3.fromRGB(255, 60, 60),
     OutRangeColor = Color3.fromRGB(255, 220, 60),
     PassColor = Color3.fromRGB(60, 255, 90),
+    RangeLimit = FACING_RANGE_DEFAULT,  -- FIX #1: exposed so users can tweak
     boxVisuals = {},
     FlashDuration = 0.25,
     FlashFade = 0.15,
@@ -1642,6 +1721,10 @@ end
 local function fvTriggerFlash(killer)
     local data = FacingVisual.boxVisuals[killer]
     if not data then return end
+    -- FIX #10: build the adornment lazily on first flash rather than for every killer
+    if not data.adornment or not data.adornment.Parent then
+        fvBuildBox(data, killer)
+    end
     local now = tick()
     data.flashUntil = now + (FacingVisual.FlashDuration or 0.25)
     data.fadeUntil  = data.flashUntil + (FacingVisual.FlashFade or 0.15)
@@ -1666,15 +1749,13 @@ local function updateBoxVisual(killer, data)
         fvTriggerFlash(killer)
     end
 
-    if not data.adornment or not data.adornment.Parent or data.adornment.Adornee ~= hrp then
-        if data.adornment and data.adornment.Parent then
-            pcall(function() data.adornment:Destroy() end)
-        end
-        data.adornment = nil
-        fvBuildBox(data, killer)
-        if not data.adornment then return end
-    end
+    -- FIX #10: no auto-build here; only update if the adornment already exists
     local ad = data.adornment
+    if not ad or not ad.Parent or ad.Adornee ~= hrp then
+        if ad and ad.Parent then pcall(function() ad:Destroy() end) end
+        data.adornment = nil
+        return
+    end
 
     local flashUntil = data.flashUntil or 0
     local fadeUntil  = data.fadeUntil or 0
@@ -1750,10 +1831,13 @@ if KillersFolder then
     KillersFolder.ChildRemoved:Connect(function(k) removeFacingBox(k) end)
 end
 
--- =========================================================
--- Keyboard shortcuts
--- =========================================================
-UIS.InputBegan:Connect(function(input, gpe)
+-- FIX #14: prevent duplicate key handlers on re-execute
+if _G.HunterInputConn then
+    pcall(function() _G.HunterInputConn:Disconnect() end)
+    _G.HunterInputConn = nil
+end
+
+_G.HunterInputConn = UIS.InputBegan:Connect(function(input, gpe)
     if gpe then return end
     if input.KeyCode == Enum.KeyCode.Q then
         pcall(function() HDT.Trigger() end)
@@ -1762,7 +1846,8 @@ UIS.InputBegan:Connect(function(input, gpe)
             pcall(function() _G.HunterStabActivate(true) end)
         end)
     elseif input.KeyCode == Enum.KeyCode.C then
-        AIM.AimFor(3.0)
+        -- FIX #2: pass nil ability to force default aim, don't inherit stun override
+        AIM.AimFor(3.0, nil)
     end
 end)
 
@@ -1853,16 +1938,24 @@ end)
 buildTab("auto block", "shield", function(Tab)
     local S = Tab:Section({ Title = "auto block" })
     S:Toggle({ Title = "enabled", Value = false, Callback = function(v) CFG.AutoBlockEnabled = v end })
-    S:Paragraph({ Title = "info", Desc = "block fires when you are inside the killer's facing box below." })
+    S:Paragraph({ Title = "info", Desc = "block fires when you are inside the killer's facing box." })
     S:Slider({ Title = "box width",  Value = { Min = 4, Max = 40, Default = FacingVisual.BoxWidth },  Callback = function(v) FacingVisual.BoxWidth  = v end })
     S:Slider({ Title = "box length", Value = { Min = 5, Max = 80, Default = FacingVisual.BoxLength }, Callback = function(v) FacingVisual.BoxLength = v end })
     S:Slider({ Title = "delay", Value = { Min = 0, Max = 0.5, Default = 0 }, Callback = function(v) CFG.BlockDelay = v end })
     S:Toggle({ Title = "sound trigger",     Value = true, Callback = function(v) CFG.SoundTrigger = v end })
     S:Toggle({ Title = "animation trigger", Value = true, Callback = function(v) CFG.AnimTrigger  = v end })
     S:Toggle({ Title = "wall check",        Value = true, Callback = function(v) CFG.WallCheck    = v end })
+
+    local P = Tab:Section({ Title = "counter attack" })
+    P:Toggle({ Title = "punch after block", Value = true, Callback = function(v) CFG.PunchAfterBlock = v end })
+    P:Slider({ Title = "punch delay", Value = { Min = 0, Max = 0.5, Default = CFG.PunchDelay }, Callback = function(v) CFG.PunchDelay = v end })
+    P:Button({ Title = "punch now", Callback = function()
+        task.spawn(function() pcall(firePunch) end)
+    end })
+    P:Paragraph({ Title = "info", Desc = "auto block fires the punch right after the block for a counter hit." })
 end)
 
--- HDT (no sliders — fixed 0.4s drag, 27s cooldown)
+-- HDT
 buildTab("hdt", "mouse-pointer", function(Tab)
     local S = Tab:Section({ Title = "hdt" })
     S:Toggle({ Title = "enabled", Value = false, Callback = function(v) HDT.Enabled = v end })
@@ -1878,8 +1971,9 @@ end)
 buildTab("aim", "crosshair", function(Tab)
     local S = Tab:Section({ Title = "aim" })
     S:Toggle({ Title = "enabled", Value = false, Callback = function(v) AIM.Enabled = v end })
-    S:Button({ Title = "pulse 3s (C)", Callback = function() AIM.AimFor(3.0) end })
+    S:Button({ Title = "pulse 3s (C)", Callback = function() AIM.AimFor(3.0, nil) end })
     S:Paragraph({ Title = "keybind", Desc = "press C in game for a 3s aim pulse" })
+    S:Paragraph({ Title = "whitelist", Desc = "Punch / Slash / Chance gun (AimGun+GunFire) / CrystalPitch / Hatchet" })
     S:Toggle({ Title = "debug", Value = false, Callback = function(v) AIM.Debug = v end })
     S:Toggle({ Title = "aim on stun", Value = true, Callback = function(v)
         if _G.HunterStunAim then _G.HunterStunAim.setEnabled(v) end
@@ -1919,6 +2013,7 @@ buildTab("box", "box", function(Tab)
     S:Slider({ Title = "length", Value = { Min = 0, Max = 80, Default = FacingVisual.BoxLength }, Callback = function(v) FacingVisual.BoxLength = v end })
     S:Slider({ Title = "height", Value = { Min = 0, Max = 30, Default = FacingVisual.BoxHeight }, Callback = function(v) FacingVisual.BoxHeight = v end })
     S:Slider({ Title = "transparency", Value = { Min = 0, Max = 0.95, Default = FacingVisual.BoxFill }, Callback = function(v) FacingVisual.BoxFill = v end })
+    S:Slider({ Title = "range limit", Value = { Min = 5, Max = 200, Default = FacingVisual.RangeLimit }, Callback = function(v) FacingVisual.RangeLimit = v end })
     S:ColorPicker({ Title = "pass color",      Color = FacingVisual.PassColor,     Callback = function(c) FacingVisual.PassColor = c end })
     S:ColorPicker({ Title = "in range color",  Color = FacingVisual.InRangeColor,  Callback = function(c) FacingVisual.InRangeColor = c end })
     S:ColorPicker({ Title = "out range color", Color = FacingVisual.OutRangeColor, Callback = function(c) FacingVisual.OutRangeColor = c end })
