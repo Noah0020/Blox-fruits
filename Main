@@ -90,7 +90,6 @@ end
 
 local CFG = {
     AutoBlockEnabled = false,
-    DetectionRange   = 22,
     BlockDelay       = 0,
     WallCheck        = true,
     SoundTrigger     = true,
@@ -132,16 +131,14 @@ local function hasLOS(killerRoot)
     return losTo(killerRoot.Position, killerRoot:FindFirstAncestorOfClass("Model"))
 end
 
--- Strictly box-only check. Uses BoxWidth/BoxLength. No facing-dot cone.
-local function isClientInKillerBox(killerRoot, rangeOverride)
+-- Box is the ONLY trigger zone. If you're inside the box, block fires.
+local function isClientInKillerBox(killerRoot)
     if not killerRoot then return false end
     local myRoot = getMyRoot()
     if not myRoot then return false end
 
     local delta = myRoot.Position - killerRoot.Position
     local dist = delta.Magnitude
-    local range = rangeOverride or CFG.DetectionRange
-    if dist > range then return false end
     if dist < 0.001 then return true end
 
     local look = killerRoot.CFrame.LookVector
@@ -154,8 +151,8 @@ local function isClientInKillerBox(killerRoot, rangeOverride)
     local forwardDist = flatDelta:Dot(flatLook)
     local lateralDist = math.abs(flatDelta:Dot(flatRight))
 
-    local length = (FacingVisual and FacingVisual.BoxLength) or 15
-    local width  = (FacingVisual and FacingVisual.BoxWidth) or 6
+    local length = (FacingVisual and FacingVisual.BoxLength) or 30
+    local width  = (FacingVisual and FacingVisual.BoxWidth)  or 12
 
     if forwardDist < 0 then return false end
     if forwardDist > length then return false end
@@ -166,23 +163,14 @@ end
 local function getFacingState(killerRoot)
     local myRoot = getMyRoot()
     if not myRoot or not killerRoot then return false, false end
-    local dist = (myRoot.Position - killerRoot.Position).Magnitude
-    local boxLength = (FacingVisual and FacingVisual.BoxLength) or 15
-    local range = math.max(CFG.DetectionRange, boxLength)
-    local ir = dist <= range
-    local fp = isClientInKillerBox(killerRoot, range)
+    local ir = true -- in-range concept removed; you're either in the box or not
+    local fp = isClientInKillerBox(killerRoot)
     return ir, fp
-end
-
-local function inRange(killerRoot)
-    local myRoot = getMyRoot()
-    if not myRoot or not killerRoot then return false end
-    return (killerRoot.Position - myRoot.Position).Magnitude <= CFG.DetectionRange
 end
 
 local function shouldBlock(killerRoot)
     if not killerRoot or not killerRoot.Parent then return false end
-    if not isClientInKillerBox(killerRoot, CFG.DetectionRange) then return false end
+    if not isClientInKillerBox(killerRoot) then return false end
     if not hasLOS(killerRoot) then return false end
     return true
 end
@@ -808,13 +796,6 @@ local function loadCharacterAnims()
             end
         end
     end)
-
-    if AIM and AIM.Debug then
-        print(string.format("[StunAim] total registered: %d", AbilityHook._registered))
-        for id, info in pairs(STUN_ANIMS) do
-            print("  ", id, "->", info.Ability)
-        end
-    end
 end
 
 local function bindAnimWatch()
@@ -846,10 +827,6 @@ local function bindAnimWatch()
 
         local lock = info.Lock * (AbilityHook.LockMultiplier or 1.0)
         AIM.AimFor(lock, info.Ability)
-
-        if AIM and AIM.Debug then
-            print(string.format("[StunAim] triggered %s for %.2fs", info.Ability, lock))
-        end
     end)
 end
 
@@ -1257,7 +1234,6 @@ local function stabActivate(force)
     stabFollow(killer)
 end
 
--- Expose for UI closure + UIS listener (both call the same reference)
 _G.HunterStabActivate = stabActivate
 
 local function stabBindAnimator()
@@ -1606,61 +1582,30 @@ lp.CharacterAdded:Connect(function(char)
     end
 end)
 
--- block box
+-- =========================================================
+-- Facing box (VISUAL ONLY — no workspace Part spawned)
+-- Uses BoxHandleAdornment, a client-side primitive that
+-- only renders locally and can't be touched/queried.
+-- =========================================================
 FacingVisual = {
     BoxEnabled = false,
     InRangeColor = Color3.fromRGB(255, 60, 60),
     OutRangeColor = Color3.fromRGB(255, 220, 60),
     PassColor = Color3.fromRGB(60, 255, 90),
     boxVisuals = {},
-    GameBoxStyle = nil,
     FlashDuration = 0.25,
     FlashFade = 0.15,
     FlashOnKillerM1 = true,
     FlashOnEnterRange = false,
     FlashOnFacingFlip = false,
     FlashOnBlock = false,
-    BoxWidth = 6,
-    BoxLength = 15,
-    BoxHeight = 6,
+    BoxWidth = 12,
+    BoxLength = 30,
+    BoxHeight = 8,
     BoxFill = 0.5,
     _blockPulse = 0,
     _lastBlockPulse = 0,
 }
-
-local function fvSniffGameBoxStyle()
-    local roots = {}
-    local map = workspace:FindFirstChild("Map")
-    if map then roots[#roots + 1] = map end
-    if KillersFolder then roots[#roots + 1] = KillersFolder end
-    local scanned = 0
-    for _, root in ipairs(roots) do
-        local stopped = false
-        for _, d in ipairs(root:GetDescendants()) do
-            scanned += 1
-            if scanned > 2000 then stopped = true break end
-            if d:IsA("BasePart") and (d.Name:lower():find("hitbox") or d:FindFirstChild("HitboxHighlight")) then
-                local hl = d:FindFirstChild("HitboxHighlight") or d:FindFirstChildOfClass("Highlight")
-                if hl then
-                    return {
-                        Material = d.Material, Transparency = d.Transparency,
-                        HighlightFillTransparency = hl.FillTransparency,
-                        HighlightOutlineTransparency = hl.OutlineTransparency,
-                        DepthMode = hl.DepthMode,
-                    }
-                end
-            end
-        end
-        if stopped then break end
-    end
-    return {
-        Material = Enum.Material.ForceField, Transparency = 0.5,
-        HighlightFillTransparency = 1, HighlightOutlineTransparency = 0,
-        DepthMode = Enum.HighlightDepthMode.AlwaysOnTop,
-    }
-end
-
-FacingVisual.GameBoxStyle = fvSniffGameBoxStyle()
 
 local function fvStateColor(ir, fp)
     if ir and fp then return FacingVisual.PassColor end
@@ -1672,7 +1617,7 @@ local function addFacingBox(killer)
     if not killer or not killer:IsA("Model") then return end
     if FacingVisual.boxVisuals[killer] then return end
     FacingVisual.boxVisuals[killer] = {
-        part = nil, highlight = nil,
+        adornment = nil,
         state = { inRange = false, facingPass = false },
         flashUntil = 0, fadeUntil = 0,
     }
@@ -1681,32 +1626,28 @@ end
 local function removeFacingBox(killer)
     local data = FacingVisual.boxVisuals[killer]
     if not data then return end
-    if data.highlight and data.highlight.Parent then pcall(function() data.highlight:Destroy() end) end
-    if data.part and data.part.Parent then pcall(function() data.part:Destroy() end) end
+    if data.adornment and data.adornment.Parent then
+        pcall(function() data.adornment:Destroy() end)
+    end
     FacingVisual.boxVisuals[killer] = nil
 end
 
-local function fvBuildBox(data, color)
-    local style = FacingVisual.GameBoxStyle or {}
-    local part = Instance.new("Part")
-    part.Name = "HunterFacingFlash"
-    part.Anchored = true; part.CanCollide = false
-    part.CanQuery = false; part.CanTouch = false
-    part.CastShadow = false; part.Massless = true
-    part.Material = style.Material or Enum.Material.ForceField
-    part.Transparency = 1; part.Color = color
-    part.Size = Vector3.new(1, 1, 1); part.Parent = workspace
-
-    local hl = Instance.new("Highlight")
-    hl.Name = "HunterFacingFlashHighlight"
-    hl.Adornee = part
-    hl.FillTransparency = 1; hl.FillColor = color
-    hl.OutlineColor = color; hl.OutlineTransparency = 1
-    hl.DepthMode = style.DepthMode or Enum.HighlightDepthMode.AlwaysOnTop
-    hl.Parent = part
-
-    data.part = part
-    data.highlight = hl
+-- Build a client-only BoxHandleAdornment attached to the killer's HRP.
+-- Nothing is inserted into workspace, nothing is spawned.
+local function fvBuildBox(data, killer)
+    local hrp = killer:FindFirstChild("HumanoidRootPart")
+    if not hrp then return end
+    local ad = Instance.new("BoxHandleAdornment")
+    ad.Name = "HunterFacingBoxVisual"
+    ad.Adornee = hrp
+    ad.AlwaysOnTop = true
+    ad.ZIndex = 5
+    ad.Color3 = FacingVisual.InRangeColor
+    ad.Transparency = 1
+    ad.Size = Vector3.new(1, 1, 1)
+    ad.CFrame = CFrame.new(0, 0, -0.5)
+    ad.Parent = hrp
+    data.adornment = ad
 end
 
 local function fvTriggerFlash(killer)
@@ -1725,29 +1666,31 @@ local function updateBoxVisual(killer, data)
     local color = fvStateColor(ir, fp)
 
     local st = data.state or { inRange = false, facingPass = false }
-    local enteredRange = ir and not st.inRange
-    local facingFlip   = ir and st.inRange and (fp ~= st.facingPass)
+    local enteredRange = fp and not st.facingPass
+    local facingFlip   = st.facingPass ~= fp
     st.inRange = ir
     st.facingPass = fp
     data.state = st
 
     if (FacingVisual.FlashOnEnterRange and enteredRange)
-       or (FacingVisual.FlashOnFacingFlip and facingFlip) then
+       or (FacingVisual.FlashOnFacingFlip and facingFlip and fp) then
         fvTriggerFlash(killer)
     end
 
-    if not data.part or not data.part.Parent or not data.highlight or not data.highlight.Parent then
-        fvBuildBox(data, color)
+    if not data.adornment or not data.adornment.Parent or data.adornment.Adornee ~= hrp then
+        if data.adornment and data.adornment.Parent then
+            pcall(function() data.adornment:Destroy() end)
+        end
+        data.adornment = nil
+        fvBuildBox(data, killer)
+        if not data.adornment then return end
     end
-    local p  = data.part
-    local hl = data.highlight
+    local ad = data.adornment
 
     local flashUntil = data.flashUntil or 0
     local fadeUntil  = data.fadeUntil or 0
     if now >= fadeUntil then
-        if p.Transparency < 1 then p.Transparency = 1 end
-        if hl.FillTransparency < 1 then hl.FillTransparency = 1 end
-        if hl.OutlineTransparency < 1 then hl.OutlineTransparency = 1 end
+        if ad.Transparency < 1 then ad.Transparency = 1 end
         return
     end
 
@@ -1759,26 +1702,22 @@ local function updateBoxVisual(killer, data)
         alpha = 1 - math.clamp((now - flashUntil) / span, 0, 1)
     end
 
-    local length = FacingVisual.BoxLength or 15
-    local width  = FacingVisual.BoxWidth  or 6
+    local length = FacingVisual.BoxLength or 30
+    local width  = FacingVisual.BoxWidth  or 12
     if width  < 0.1 then width  = 0.1 end
-    local height = FacingVisual.BoxHeight or 6
+    local height = FacingVisual.BoxHeight or 8
     if height < 0.1 then height = 0.1 end
     if length < 0.1 then length = 0.1 end
 
-    p.Size = Vector3.new(width, height, length)
-    local origin = hrp.Position
-    local look   = hrp.CFrame.LookVector
-    local center = origin + look * (length / 2)
-    p.CFrame = CFrame.lookAt(center, center + look)
-    p.Color = color
-    p.Material = (FacingVisual.GameBoxStyle and FacingVisual.GameBoxStyle.Material) or Enum.Material.ForceField
+    -- BoxHandleAdornment CFrame is relative to Adornee (killer HRP).
+    -- -Z in local space is the "forward" direction (LookVector).
+    -- Offset the box forward by half its length so it sits in front.
+    ad.CFrame = CFrame.new(0, 0, -length / 2)
+    ad.Size = Vector3.new(width, height, length)
+    ad.Color3 = color
 
     local baseTrans = FacingVisual.BoxFill or 0.5
-    p.Transparency = math.clamp(baseTrans + (1 - alpha) * 0.8, 0, 1)
-    hl.FillColor = color; hl.OutlineColor = color
-    hl.FillTransparency    = 1
-    hl.OutlineTransparency = 1 - alpha
+    ad.Transparency = math.clamp(baseTrans + (1 - alpha) * 0.8, 0, 1)
 end
 
 function FacingVisual.FlashKiller(killerModel)
@@ -1803,7 +1742,7 @@ task.spawn(function()
                 for _, k in ipairs(KillersFolder:GetChildren()) do
                     if k:IsA("Model") then
                         local hrp = k:FindFirstChild("HumanoidRootPart")
-                        if hrp and inRange(hrp) then
+                        if hrp and isClientInKillerBox(hrp) then
                             if not FacingVisual.boxVisuals[k] then addFacingBox(k) end
                             fvTriggerFlash(k)
                         end
@@ -1826,8 +1765,7 @@ if KillersFolder then
 end
 
 -- =========================================================
--- Hardwired keyboard shortcuts (independent of WindUI)
--- Q = HDT trigger, H = stab, C = aim pulse
+-- Keyboard shortcuts
 -- =========================================================
 UIS.InputBegan:Connect(function(input, gpe)
     if gpe then return end
@@ -1890,8 +1828,6 @@ do
     end
 end
 
--- Build each tab inside its own pcall so a failure in one tab
--- doesn't take down the others (and tells us which one failed).
 local function buildTab(name, icon, builder)
     local ok, err = pcall(function()
         local tab = Window:Tab({ Title = name, Icon = icon or "circle" })
@@ -1927,12 +1863,13 @@ buildTab("stam", "zap", function(Tab)
     end
 end)
 
--- AUTO BLOCK
+-- AUTO BLOCK — box is now the trigger zone. Sliders here directly control it.
 buildTab("auto block", "shield", function(Tab)
     local S = Tab:Section({ Title = "auto block" })
     S:Toggle({ Title = "enabled", Value = false, Callback = function(v) CFG.AutoBlockEnabled = v end })
-    S:Paragraph({ Title = "info", Desc = "block only fires when you are inside the killer's facing box (width x length)." })
-    S:Slider({ Title = "range", Value = { Min = 8, Max = 60, Default = CFG.DetectionRange }, Callback = function(v) CFG.DetectionRange = v end })
+    S:Paragraph({ Title = "info", Desc = "block fires when you are inside the killer's facing box below. The box is the ONLY trigger zone." })
+    S:Slider({ Title = "box width",  Value = { Min = 4, Max = 40, Default = FacingVisual.BoxWidth },  Callback = function(v) FacingVisual.BoxWidth  = v end })
+    S:Slider({ Title = "box length", Value = { Min = 5, Max = 80, Default = FacingVisual.BoxLength }, Callback = function(v) FacingVisual.BoxLength = v end })
     S:Slider({ Title = "delay", Value = { Min = 0, Max = 0.5, Default = 0 }, Callback = function(v) CFG.BlockDelay = v end })
     S:Toggle({ Title = "sound trigger",     Value = true, Callback = function(v) CFG.SoundTrigger = v end })
     S:Toggle({ Title = "animation trigger", Value = true, Callback = function(v) CFG.AnimTrigger  = v end })
@@ -1982,22 +1919,23 @@ buildTab("aim", "crosshair", function(Tab)
     S:Slider({ Title = "ping mult", Value = { Min = 0, Max = 2, Default = AIM.PingMult }, Callback = function(v) AIM.PingMult = v end })
 end)
 
--- BOX
+-- BOX (visual only)
 buildTab("box", "box", function(Tab)
-    local S = Tab:Section({ Title = "box" })
-    S:Toggle({ Title = "enabled", Value = false, Callback = function(v)
+    local S = Tab:Section({ Title = "box (visual only)" })
+    S:Toggle({ Title = "show box", Value = false, Callback = function(v)
         FacingVisual.BoxEnabled = v
         if not v then
             for _, data in pairs(FacingVisual.boxVisuals) do
-                if data.highlight and data.highlight.Parent then pcall(function() data.highlight:Destroy() end) end
-                if data.part and data.part.Parent then pcall(function() data.part:Destroy() end) end
+                if data.adornment and data.adornment.Parent then
+                    pcall(function() data.adornment:Destroy() end)
+                end
             end
             FacingVisual.boxVisuals = {}
         end
     end })
     S:Toggle({ Title = "flash on killer m1", Value = true, Callback = function(v) FacingVisual.FlashOnKillerM1 = v end })
-    S:Slider({ Title = "width",  Value = { Min = 0, Max = 30, Default = FacingVisual.BoxWidth },  Callback = function(v) FacingVisual.BoxWidth = v end })
-    S:Slider({ Title = "length", Value = { Min = 0, Max = 30, Default = FacingVisual.BoxLength }, Callback = function(v) FacingVisual.BoxLength = v end })
+    S:Slider({ Title = "width",  Value = { Min = 0, Max = 40, Default = FacingVisual.BoxWidth },  Callback = function(v) FacingVisual.BoxWidth = v end })
+    S:Slider({ Title = "length", Value = { Min = 0, Max = 80, Default = FacingVisual.BoxLength }, Callback = function(v) FacingVisual.BoxLength = v end })
     S:Slider({ Title = "height", Value = { Min = 0, Max = 30, Default = FacingVisual.BoxHeight }, Callback = function(v) FacingVisual.BoxHeight = v end })
     S:Slider({ Title = "transparency", Value = { Min = 0, Max = 0.95, Default = FacingVisual.BoxFill }, Callback = function(v) FacingVisual.BoxFill = v end })
     S:ColorPicker({ Title = "pass color",      Color = FacingVisual.PassColor,     Callback = function(c) FacingVisual.PassColor = c end })
@@ -2008,41 +1946,29 @@ buildTab("box", "box", function(Tab)
     S:Toggle({ Title = "flash on enter range", Value = false, Callback = function(v) FacingVisual.FlashOnEnterRange = v end })
     S:Toggle({ Title = "flash on facing flip", Value = false, Callback = function(v) FacingVisual.FlashOnFacingFlip = v end })
     S:Toggle({ Title = "flash on block fire",  Value = false, Callback = function(v) FacingVisual.FlashOnBlock = v end })
-    S:Button({ Title = "reset 6/15/6", Callback = function()
-        FacingVisual.BoxWidth = 6 FacingVisual.BoxLength = 15 FacingVisual.BoxHeight = 6
+    S:Button({ Title = "reset 12/30/8", Callback = function()
+        FacingVisual.BoxWidth = 12 FacingVisual.BoxLength = 30 FacingVisual.BoxHeight = 8
     end })
 end)
 
--- STAB (rebuilt: only basic methods, all callbacks pcall-wrapped)
+-- STAB
 buildTab("stab", "sword", function(Tab)
     local S = Tab:Section({ Title = "stab" })
-    S:Toggle({ Title = "enabled", Value = false, Callback = function(v)
-        STAB.Enabled = v
-    end })
+    S:Toggle({ Title = "enabled", Value = false, Callback = function(v) STAB.Enabled = v end })
     S:Button({ Title = "stab now (H)", Callback = function()
         task.spawn(function()
             pcall(function() _G.HunterStabActivate(true) end)
         end)
     end })
     S:Paragraph({ Title = "keybind", Desc = "press H in game to stab manually" })
-    S:Slider({ Title = "behind offset", Value = { Min = 0.5, Max = 6, Default = STAB.BehindOffset }, Callback = function(v)
-        STAB.BehindOffset = v
-    end })
-    S:Slider({ Title = "max range", Value = { Min = 10, Max = 150, Default = STAB.MaxRange }, Callback = function(v)
-        STAB.MaxRange = v
-    end })
-    S:Slider({ Title = "cooldown", Value = { Min = 0.1, Max = 2, Default = STAB.Cooldown }, Callback = function(v)
-        STAB.Cooldown = v
-    end })
-    S:Slider({ Title = "tp delay", Value = { Min = 0, Max = 0.2, Default = STAB.TeleportDelay }, Callback = function(v)
-        STAB.TeleportDelay = v
-    end })
-    S:Slider({ Title = "follow duration", Value = { Min = 0.1, Max = 2, Default = STAB.FollowDuration }, Callback = function(v)
-        STAB.FollowDuration = v
-    end })
+    S:Slider({ Title = "behind offset", Value = { Min = 0.5, Max = 6, Default = STAB.BehindOffset }, Callback = function(v) STAB.BehindOffset = v end })
+    S:Slider({ Title = "max range", Value = { Min = 10, Max = 150, Default = STAB.MaxRange }, Callback = function(v) STAB.MaxRange = v end })
+    S:Slider({ Title = "cooldown", Value = { Min = 0.1, Max = 2, Default = STAB.Cooldown }, Callback = function(v) STAB.Cooldown = v end })
+    S:Slider({ Title = "tp delay", Value = { Min = 0, Max = 0.2, Default = STAB.TeleportDelay }, Callback = function(v) STAB.TeleportDelay = v end })
+    S:Slider({ Title = "follow duration", Value = { Min = 0.1, Max = 2, Default = STAB.FollowDuration }, Callback = function(v) STAB.FollowDuration = v end })
 end)
 
--- MISC (rebuilt: no Divider, only basic methods)
+-- MISC
 buildTab("misc", "settings", function(Tab)
     local S = Tab:Section({ Title = "azure qte" })
     S:Toggle({ Title = "auto qte", Value = false, Callback = function(v)
@@ -2132,7 +2058,6 @@ buildTab("misc", "settings", function(Tab)
     end })
 end)
 
--- THEME (kept simple)
 buildTab("theme", "palette", function(Tab)
     local S = Tab:Section({ Title = "theme" })
     S:Button({ Title = "Blood (default)", Callback = function() pcall(function() WindUI:SetTheme("Blood") end) end })
