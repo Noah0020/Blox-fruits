@@ -131,7 +131,6 @@ local function hasLOS(killerRoot)
     return losTo(killerRoot.Position, killerRoot:FindFirstAncestorOfClass("Model"))
 end
 
--- Box is the ONLY trigger zone. If you're inside the box, block fires.
 local function isClientInKillerBox(killerRoot)
     if not killerRoot then return false end
     local myRoot = getMyRoot()
@@ -163,7 +162,7 @@ end
 local function getFacingState(killerRoot)
     local myRoot = getMyRoot()
     if not myRoot or not killerRoot then return false, false end
-    local ir = true -- in-range concept removed; you're either in the box or not
+    local ir = true
     local fp = isClientInKillerBox(killerRoot)
     return ir, fp
 end
@@ -378,11 +377,16 @@ end
 
 -- =========================================================
 -- HDT
+-- Drags for 0.4s then stops. 27s cooldown between drags.
+-- No UI sliders — all tuned internally.
 -- =========================================================
 HDT = {
-    Enabled = false, AutoTrigger = true, Speed = 10, Delay = 0,
-    StopDistance = 2, SafetyTimeout = 1.5,
-    ReTriggerCooldown = 1.0, MaxRange = 40,
+    Enabled = false, AutoTrigger = true,
+    Speed = 12,              -- studs / second
+    StopDistance = 2,
+    DragDuration = 0.4,      -- how long the drag lasts
+    Cooldown = 27,           -- cooldown between drags
+    MaxRange = 40,           -- max start distance
     _dragId = 0, _dragging = false, _conn = nil, _saved = nil,
     _lastFire = 0, _fireDebounce = 0.15,
     _cooldownUntil = 0,
@@ -422,7 +426,7 @@ local function startDrag(targetPart)
         finished = true
         if HDT._dragId ~= myId then return end
         HDT._dragging = false
-        HDT._cooldownUntil = tick() + (HDT.ReTriggerCooldown or 1.0)
+        HDT._cooldownUntil = tick() + (HDT.Cooldown or 27)
         if HDT._conn then HDT._conn:Disconnect() HDT._conn = nil end
         if hrp and hrp.Parent then
             hrp.AssemblyLinearVelocity = Vector3.zero
@@ -465,7 +469,8 @@ local function startDrag(targetPart)
         hrp.AssemblyAngularVelocity = Vector3.zero
     end)
 
-    task.delay(HDT.SafetyTimeout, function()
+    -- Fixed drag duration instead of per-slider value
+    task.delay(HDT.DragDuration, function()
         if HDT._dragId == myId and HDT._dragging then cleanup() end
     end)
 end
@@ -483,16 +488,11 @@ function HDT.TriggerFromAutoBlock(force)
     if myRoot then
         local d = (target.Position - myRoot.Position).Magnitude
         if d <= HDT.StopDistance + 0.5 then return end
-        if d > (HDT.MaxRange or 40) then return end
+        if d > HDT.MaxRange then return end
     end
 
     HDT._lastFire = tick()
-
-    if HDT.Delay > 0 then
-        task.delay(HDT.Delay, function() startDrag(target) end)
-    else
-        startDrag(target)
-    end
+    startDrag(target)
 end
 HDT.Trigger = function() HDT.TriggerFromAutoBlock(true) end
 
@@ -735,9 +735,6 @@ local function registerAnimsFrom(anims, source)
                 Lock      = lock,
             }
         end
-    end
-    if AIM and AIM.Debug then
-        print(string.format("[StunAim] %s: %d anims registered", source or "?", count))
     end
     return count
 end
@@ -1122,9 +1119,7 @@ local function stopInfiniteStamina()
     end)
 end
 
--- =========================================================
 -- STAB
--- =========================================================
 STAB = {
     Enabled = false, BehindOffset = 1.7, MaxRange = 60, Cooldown = 0.5,
     TeleportDelay = 0.02, FollowDuration = 0.5,
@@ -1582,11 +1577,7 @@ lp.CharacterAdded:Connect(function(char)
     end
 end)
 
--- =========================================================
--- Facing box (VISUAL ONLY — no workspace Part spawned)
--- Uses BoxHandleAdornment, a client-side primitive that
--- only renders locally and can't be touched/queried.
--- =========================================================
+-- Facing box (visual only — BoxHandleAdornment)
 FacingVisual = {
     BoxEnabled = false,
     InRangeColor = Color3.fromRGB(255, 60, 60),
@@ -1632,8 +1623,6 @@ local function removeFacingBox(killer)
     FacingVisual.boxVisuals[killer] = nil
 end
 
--- Build a client-only BoxHandleAdornment attached to the killer's HRP.
--- Nothing is inserted into workspace, nothing is spawned.
 local function fvBuildBox(data, killer)
     local hrp = killer:FindFirstChild("HumanoidRootPart")
     if not hrp then return end
@@ -1709,9 +1698,6 @@ local function updateBoxVisual(killer, data)
     if height < 0.1 then height = 0.1 end
     if length < 0.1 then length = 0.1 end
 
-    -- BoxHandleAdornment CFrame is relative to Adornee (killer HRP).
-    -- -Z in local space is the "forward" direction (LookVector).
-    -- Offset the box forward by half its length so it sits in front.
     ad.CFrame = CFrame.new(0, 0, -length / 2)
     ad.Size = Vector3.new(width, height, length)
     ad.Color3 = color
@@ -1863,11 +1849,11 @@ buildTab("stam", "zap", function(Tab)
     end
 end)
 
--- AUTO BLOCK — box is now the trigger zone. Sliders here directly control it.
+-- AUTO BLOCK
 buildTab("auto block", "shield", function(Tab)
     local S = Tab:Section({ Title = "auto block" })
     S:Toggle({ Title = "enabled", Value = false, Callback = function(v) CFG.AutoBlockEnabled = v end })
-    S:Paragraph({ Title = "info", Desc = "block fires when you are inside the killer's facing box below. The box is the ONLY trigger zone." })
+    S:Paragraph({ Title = "info", Desc = "block fires when you are inside the killer's facing box below." })
     S:Slider({ Title = "box width",  Value = { Min = 4, Max = 40, Default = FacingVisual.BoxWidth },  Callback = function(v) FacingVisual.BoxWidth  = v end })
     S:Slider({ Title = "box length", Value = { Min = 5, Max = 80, Default = FacingVisual.BoxLength }, Callback = function(v) FacingVisual.BoxLength = v end })
     S:Slider({ Title = "delay", Value = { Min = 0, Max = 0.5, Default = 0 }, Callback = function(v) CFG.BlockDelay = v end })
@@ -1876,7 +1862,7 @@ buildTab("auto block", "shield", function(Tab)
     S:Toggle({ Title = "wall check",        Value = true, Callback = function(v) CFG.WallCheck    = v end })
 end)
 
--- HDT
+-- HDT (no sliders — fixed 0.4s drag, 27s cooldown)
 buildTab("hdt", "mouse-pointer", function(Tab)
     local S = Tab:Section({ Title = "hdt" })
     S:Toggle({ Title = "enabled", Value = false, Callback = function(v) HDT.Enabled = v end })
@@ -1884,13 +1870,8 @@ buildTab("hdt", "mouse-pointer", function(Tab)
     S:Button({ Title = "trigger now (Q)", Callback = function()
         task.spawn(function() pcall(function() HDT.Trigger() end) end)
     end })
+    S:Paragraph({ Title = "info", Desc = "drags toward the killer for 0.4s, then 27s cooldown." })
     S:Paragraph({ Title = "keybind", Desc = "press Q in game to trigger manually" })
-    S:Slider({ Title = "speed",         Value = { Min = 2, Max = 40, Default = HDT.Speed }, Callback = function(v) HDT.Speed = v end })
-    S:Slider({ Title = "delay",         Value = { Min = 0, Max = 2, Default = HDT.Delay }, Callback = function(v) HDT.Delay = v end })
-    S:Slider({ Title = "stop distance", Value = { Min = 1, Max = 8, Default = HDT.StopDistance }, Callback = function(v) HDT.StopDistance = v end })
-    S:Slider({ Title = "max range",     Value = { Min = 5, Max = 200, Default = HDT.MaxRange }, Callback = function(v) HDT.MaxRange = v end })
-    S:Slider({ Title = "max drag time", Value = { Min = 0.2, Max = 3, Default = HDT.SafetyTimeout }, Callback = function(v) HDT.SafetyTimeout = v end })
-    S:Slider({ Title = "re-trigger cd", Value = { Min = 0, Max = 5, Default = HDT.ReTriggerCooldown }, Callback = function(v) HDT.ReTriggerCooldown = v end })
 end)
 
 -- AIM
@@ -1919,7 +1900,7 @@ buildTab("aim", "crosshair", function(Tab)
     S:Slider({ Title = "ping mult", Value = { Min = 0, Max = 2, Default = AIM.PingMult }, Callback = function(v) AIM.PingMult = v end })
 end)
 
--- BOX (visual only)
+-- BOX
 buildTab("box", "box", function(Tab)
     local S = Tab:Section({ Title = "box (visual only)" })
     S:Toggle({ Title = "show box", Value = false, Callback = function(v)
